@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to create AWS Glue Database and Crawler with daily schedule'
+
+Parameters:
+  S3SourcePath:
+    Type: String
+    Description: 'Full S3 path to crawl (e.g., s3://bucket-name/path/to/data or s3://bucket-name for entire bucket)'
+    AllowedPattern: '^s3://[a-z0-9][a-z0-9\-\.]*[a-z0-9](/.*)?$'
+    ConstraintDescription: 'Must be a valid S3 URI starting with s3:// (e.g., s3://my-bucket or s3://my-bucket/path)'
+  
+  ScheduleTime:
+    Type: String
+    Description: 'Time to run the crawler daily in HH:MM format (24-hour format, UTC)'
+    AllowedPattern: '^([0-1][0-9]|2[0-3]):[0-5][0-9]$'
+    ConstraintDescription: 'Must be in HH:MM format (e.g., 14:30)'
+  
+  DatabaseName:
+    Type: String
+    Description: 'Name for the Glue database : Must contain only lowercase letters, numbers, and underscores'
+    Default: 'cur_db'
+    AllowedPattern: '^[a-z0-9_]+$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and underscores'
+  
+  CrawlerName:
+    Type: String
+    Description: 'Name for the Glue crawler'
+    Default: 'cur_crawler'
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: 'Must contain only letters, numbers, hyphens, and underscores'
+
+Resources:
+  # IAM Role for Glue Crawler
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${CrawlerName}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: !Select [2, !Split ['/', !Ref S3SourcePath]]
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - BucketName: !Select [2, !Split ['/', !Ref S3SourcePath]]
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:/aws-glue/*'
+
+  # Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: 'Database for S3 crawler'
+
+  # Glue Crawler
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Ref CrawlerName
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      TablePrefix: 'cur'
+      Targets:
+        S3Targets:
+          - Path: !Ref S3SourcePath
+            Exclusions:
+              - '**.json'
+              - '**.zip'
+              - '**.csv'
+              - '**.sql'
+      Schedule:
+        ScheduleExpression: !Sub 
+          - 'cron(${Minutes} ${Hours} ? * * *)'
+          - Minutes: !Select [1, !Split [':', !Ref ScheduleTime]]
+            Hours: !Select [0, !Split [':', !Ref ScheduleTime]]
+      SchemaChangePolicy:
+        UpdateBehavior: 'UPDATE_IN_DATABASE'
+        DeleteBehavior: 'LOG'
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${CrawlerName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: GlueCrawlerStartPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'glue:StartCrawler'
+                  - 'glue:GetCrawler'
+                Resource: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${CrawlerName}'
+
+  # Lambda Function to Start Crawler
+  StartCrawlerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GlueCrawler
+    Properties:
+      FunctionName: !Sub '${CrawlerName}-starter'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          glue = boto3.client('glue')
+          
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              
+              crawler_name = event['ResourceProperties']['CrawlerName']
+              request_type = event['RequestType']
+              
+              try:
+                  if request_type == 'Create' or request_type == 'Update':
+                      # Check crawler status first
+                      response = glue.get_crawler(Name=crawler_name)
+                      crawler_state = response['Crawler']['State']
+                      
+                      if crawler_state == 'READY':
+                          print(f"Starting crawler: {crawler_name}")
+                          glue.start_crawler(Name=crawler_name)
+                          message = f"Successfully started crawler: {crawler_name}"
+                      else:
+                          message = f"Crawler {crawler_name} is in state {crawler_state}, not starting"
+                      
+                      print(message)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {'Message': message})
+                  
+                  elif request_type == 'Delete':
+                      # No action needed on delete
+                      print(f"Delete request - no action needed")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {'Message': 'Delete completed'})
+              
+              except glue.exceptions.CrawlerRunningException:
+                  message = f"Crawler {crawler_name} is already running"
+                  print(message)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                 {'Message': message})
+              
+              except Exception as e:
+                  error_message = f"Error: {str(e)}"
+                  print(error_message)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                 {'Message': error_message})
+
+  # Custom Resource to Invoke Lambda
+  StartCrawlerCustomResource:
+    Type: Custom::StartCrawler
+    DependsOn: 
+      - GlueCrawler
+      - StartCrawlerFunction
+    Properties:
+      ServiceToken: !GetAtt StartCrawlerFunction.Arn
+      CrawlerName: !Ref CrawlerName
+
+Outputs:
+  DatabaseName:
+    Description: 'Name of the created Glue Database'
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+  
+  CrawlerName:
+    Description: 'Name of the created Glue Crawler'
+    Value: !Ref GlueCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-CrawlerName'
+  
+  CrawlerRoleArn:
+    Description: 'ARN of the IAM Role used by the Crawler'
+    Value: !GetAtt GlueCrawlerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CrawlerRoleArn'
+  
+  S3Target:
+    Description: 'S3 path being crawled'
+    Value: !Ref S3SourcePath
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Target'
+  
+  CrawlerSchedule:
+    Description: 'Crawler schedule expression'
+    Value: !Sub 
+      - 'cron(${Minutes} ${Hours} ? * * *) - Daily at ${ScheduleTime} UTC'
+      - Minutes: !Select [1, !Split [':', !Ref ScheduleTime]]
+        Hours: !Select [0, !Split [':', !Ref ScheduleTime]]
+  
+  StartCrawlerFunctionArn:
+    Description: 'ARN of the Lambda function that starts the crawler'
+    Value: !GetAtt StartCrawlerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StartCrawlerFunctionArn'
+  
+  InitialCrawlerStatus:
+    Description: 'Initial crawler execution status'
+    Value: 'Crawler started automatically upon stack creation'
