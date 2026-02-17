@@ -3,6 +3,10 @@
 
 SELECT 
 
+-- if all service cost clubed togather  (remove grouped by in that case)  
+'other_service' AS service,
+
+-- each service wise cost    
 CASE 
     WHEN bill_billing_entity = 'AWS Marketplace'
     THEN 'AWS Marketplace'
