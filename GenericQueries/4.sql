@@ -7,13 +7,13 @@ SELECT
 'other_service' AS service,
 
 -- each service wise cost    
-CASE 
-    WHEN bill_billing_entity = 'AWS Marketplace'
-    THEN 'AWS Marketplace'
-    WHEN (product_servicecode IS NULL OR product_servicecode = '')
-    THEN line_item_product_code
-    ELSE product_servicecode
-END AS service,
+-- CASE 
+--     WHEN bill_billing_entity = 'AWS Marketplace'
+--     THEN 'AWS Marketplace'
+--     WHEN (product_servicecode IS NULL OR product_servicecode = '')
+--     THEN line_item_product_code
+--     ELSE product_servicecode
+-- END AS service,
 
 -- If need Daily Granularity
 -- DATE(at_timezone(line_item_usage_start_date,'UTC')) AS usage_date,
