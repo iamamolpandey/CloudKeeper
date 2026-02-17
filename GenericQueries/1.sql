@@ -22,7 +22,7 @@ END AS service,
 -- line_item_line_item_type,
 
 -- Unblended Cost upto two decimal place
-ROUND(SUM(line_item_unblended_cost),2) AS cost
+ROUND(SUM(line_item_unblended_cost),2) AS ec2_cost
 
 FROM "db_name"."table_name" 
 WHERE
@@ -54,8 +54,11 @@ AND COALESCE(
 -- AND line_item_operation LIKE '%NatGateway'
 
 -- for EC2 Running Hour
--- AND line_item_operation LIKE 'RunInstance%'
-
+-- AND (
+--     line_item_operation LIKE 'RunInstance%'
+--     OR line_item_operation LIKE '%CPUCredits'
+-- )
+    
 AND line_item_line_item_type != 'SavingsPlanNegation'
 AND DATE(at_timezone(line_item_usage_start_date,'UTC')) BETWEEN DATE '2026-01-01' AND DATE '2026-01-31'
 Group By 1;
